@@ -1,0 +1,377 @@
+---
+title: "Milestone Report for NLP Capstone Project"
+author: "Sambit Datta"
+date: "March 14 2016"
+output: 
+  html_document:
+    toc: true
+    theme: united
+---
+
+## Introduction 
+
+This is the milestone report for the Data Science Specialization Capstone Project on Coursera. This report intends to show my current progress and discussion with hopes of obtaining some constructive feedback from my peers and teachers. As the intended audience for this report are non-data scientists, I have kept code output to minimum and if it interests the reader, you may view the source code for this file at my [Github repository](https://github.com/zaros/coursera-capstone).
+
+## Executive Summary
+
+The objective of this  Data Science Specialization Capstone Project is to produce a predictive text algorithm in R that based on a user’s text input. As the user types some text the system will suggest the next most likely word to be entered. 
+
+From my current understanding of the task I will need to process the user's input as they type and compare the text against a word list. The predicted word will be the word that has the highest probability following the previous word or multi-word phrase. 
+
+At this stage of the project I have downloaded the dataset provided and performed some exploratory analyses and data preparation in order to proceed with the predictive modeling and construction of the end user application.
+
+My immediate objective is to find the optimal sample size from the dataset required to build a corpus on which to train the prediction algorithm. The raw dataset is too large to be used even from the beginning (my computer crashes even when processing a sample of 0.05% from the dataset); and the final corpus will need to work well using minimum possible memory as suitable on a mobile device. 
+
+## Understanding The Problem
+
+From my current understanding of the task I will need to process the user's input as they type and compare the text against a word list. The predicted word will be the word that has the highest probability following the previous word or multi-word phrase. 
+
+Immediate problems are problems such as how to handle undesirable features within the dataset such as non-English words, abbreviations and contractions, foul language (we don't want to offer bad words).
+
+The main problem to arise is if we are trying to achieve total coverage of all possible word combinations, the algorithm will need to process a large amount of data which exceeds available computing resources as well as making the user wait. So a strategy is needed to find the minimal size of data to use, while achieving maximum coverage, and word suggestions delivered within a tolerable time.
+
+The next problem will be to predict the correct -- i.e. the most relevant -- word. In the simplest case, this can be done by choosing the highest frequently used word after one or more words. From my little understanding at this stage, there are advanced techniques which will improve relevancy, and I will explore these techniques further as I learn more to complete the project.
+
+
+```{r Libraries & functions,echo=FALSE,warning=FALSE,message=FALSE}
+
+set.seed(5262)
+
+library(tm)
+library(SnowballC)
+library(RWeka)
+library(qdap)
+library(caret)
+
+
+make_corpus <- function(chrVector) {
+  # create corpus
+  corpus<- Corpus(VectorSource(chrVector))
+
+  # Convert to lowercase
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  
+   # remove emails
+  removeEmails <- function(x) {gsub("\\S+@\\S+", "", x)}
+ corpus <- tm_map(corpus,removeEmails)
+
+ # remove URLS
+  removeUrls <- function(x) {gsub("http[[:alnum:]]*","",x)}
+ corpus <- tm_map(corpus,removeUrls)
+ 
+ # Remove Twitter hashtags
+ removeHashtags <- function(x) {gsub("#[[:alnum:]]*","",x)}
+ corpus <- tm_map(corpus,removeHashtags)
+
+  # remove Twitter handles (e.g. @username)
+  removeHandles <- function(x) {gsub("@[[:alnum:]]*","",x)}
+  corpus <- tm_map(corpus,removeHandles)
+ 
+  # remove twitter specific terms like RT (retweet) and PM (private message)
+  corpus <- tm_map(corpus, removeWords, c("rt","pm","p m"))
+
+  # remove punctuation, numbers, whitespace, numbers and bad words  
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, stripWhitespace)
+  corpus<- tm_map(corpus,removeNumbers)
+  corpus <- tm_map(corpus, removeWords, stopwords("en"))
+  
+  # remove bad words (wordlist obtained from http://www.bannedwordlist.com)
+   badwords <- read.csv('./swearWords.csv',stringsAsFactors = FALSE,header=FALSE)
+   
+   corpus <- tm_map(corpus, removeWords, badwords)
+   corpus<- tm_map(corpus, PlainTextDocument)
+  
+   corpus
+}
+
+process_grams <- function(grams) {
+  df <- data.frame(table(grams),stringsAsFactors = FALSE)
+  df <- df[order(-df$Freq),]
+  df$cumsum <- cumsum(df$Freq)
+  df$pct <- (df$Freq/sum(df$Freq))*100
+  df$cumpct <- cumsum(df$pct)
+  df
+}
+```
+## Summary of Data
+
+```{r Loading data,cache=TRUE,echo=FALSE}
+locale <- "en_US"
+src <- DirSource(paste("./data",locale,sep="/"))
+corpus <- Corpus(src, readerControl=list(reader=readPlain))
+
+# extract each dataset
+blogs <- corpus[[1]]$content
+news <- corpus[[2]]$content
+twitter <- corpus[[3]]$content
+```
+
+The dataset which was downloaded comprises three files which contains texts mined from blogs, news and Twitter sources. I loaded the complete dataset into R and performed some basic explorations, as summarised below:
+
+```{r Summary of data,echo=FALSE}
+summaryTable <- data.frame(
+  "Source"=c("Blogs","News","Twitter"),
+  "Number of lines"=c(length(blogs),length(news),length(twitter)),
+  "Average length"=c(mean(nchar(blogs)),mean(nchar(news)),mean(nchar(twitter))),
+  "Min length"=c(min(nchar(blogs)),min(nchar(news)),min(nchar(twitter))),
+  "Max length"=c(max(nchar(blogs)),max(nchar(news)),max(nchar(twitter))),
+  "Variance" = c(var(nchar(blogs)),var(nchar(news)),var(nchar(twitter))),
+  "Std. Dev." = c(sd(nchar(blogs)),sd(nchar(news)),sd(nchar(twitter)))
+  )
+
+knitr::kable(summaryTable)
+```
+
+From this summary we can see observe some features of the dataset and their implications: 
+
+- They are very large files and we will need to obtain random samples for processing
+- The minimum character counts of 0 and 1 show that the files contain some meaningless text
+- The maximum character count of 421 for Twitter shows that it contains at least one line which exceeds the expected character limit of 142 
+- The relatively small means and standard deviation compared to the maximum values suggest that the majority of lines contain less than 1000 characters
+
+To understand the problem further, I made a density plot to visualise the relative spread of line lengths between the three sources. I have constrained the x-axis to 1000 characters; in reality the plot extends to over 40,000 characters. 
+
+```{r Density plot of character lengths, echo=FALSE}
+nchar.blogs <- nchar(blogs)
+nchar.news <- nchar(news)
+nchar.twitter <- nchar(twitter)
+
+plot.new()
+d.nchar.blogs <- density(nchar.blogs)
+d.nchar.news <- density(nchar.news)
+d.nchar.twitter <- density(nchar.twitter)
+
+plot(d.nchar.blogs,xlim=c(0,1000),ylim=c(0,0.012),xlab="Number of Characters",ylab="Density",main="Distribution of Number of Characters per Line (zoomed)")
+
+lines(d.nchar.news,col="blue")
+lines(d.nchar.twitter,col="red")
+
+legend(cex=0.8,"topright",fill=c("black","blue","red"),c("Blogs","News","Twitter"))
+
+abline(v=142,col="orange",lty=2) # Twitter 142 character limit
+
+```
+
+The plot shows that Twitter lines tend to be very short, whereas the lengths of blogs and news lines are highly variable. However, it seems that the variations are due to outliers in the data.
+
+## Sampling the Data
+
+```{r Sampling data, echo=FALSE, cache=TRUE}
+subset.pct = 0.001
+s.blogs <- blogs[sample(length(blogs),subset.pct*length(blogs))]
+s.news <- news[sample(length(news),subset.pct*length(news))]
+
+subset.pct = 0.0005
+s.twitter <- twitter[sample(length(twitter),subset.pct*length(twitter))]
+```
+
+Using the `caret` library I obtained a random sampling of 0.1% of the blogs and news dataset, and 0.05% of the twitter dataset. The sample size is very small in order for me to quickly perform various experiments on the dataset. The summary statistics of the samples in terms of character counts per line are shown below.
+
+```{r Sampling Summary,echo=FALSE} 
+summaryTable2 <- data.frame(
+  "Source"=c("Blogs","News","Twitter"),
+  "Number of lines"=c(length(s.blogs),length(s.news),length(s.twitter)),
+  "Average length"=c(mean(nchar(s.blogs)),mean(nchar(s.news)),mean(nchar(s.twitter))),
+  "Min length"=c(min(nchar(s.blogs)),min(nchar(s.news)),min(nchar(s.twitter))),
+  "Max length"=c(max(nchar(s.blogs)),max(nchar(s.news)),max(nchar(s.twitter))),
+  "Variance" = c(var(nchar(s.blogs)),var(nchar(s.news)),var(nchar(s.twitter))),
+  "Std. Dev." = c(sd(nchar(s.blogs)),sd(nchar(s.news)),sd(nchar(s.twitter)))
+  )
+
+knitr::kable(summaryTable2)
+```
+
+The sample statistics appears to be representative of the full dataset. Plotting the distribution of number of characters per line as before:
+
+
+```{r Sample distributions, echo=FALSE}
+
+nchar.sblogs <- nchar(s.blogs)
+nchar.snews <- nchar(s.news)
+nchar.stwitter <- nchar(s.twitter)
+
+plot.new()
+d.nchar.sblogs <- density(nchar.sblogs)
+d.nchar.snews <- density(nchar.snews)
+d.nchar.stwitter <- density(nchar.stwitter)
+
+plot(d.nchar.sblogs,ylim=c(0,0.012),xlab="Number of Characters",ylab="Density",main="Distribution of Number of Characters per Line (zoomed)")
+
+lines(d.nchar.snews,col="blue")
+lines(d.nchar.stwitter,col="red")
+
+legend(cex=0.8,"topright",fill=c("black","blue","red","green"),c("Blogs","News","Twitter"))
+abline(v=142,col="orange",lty=2) # Twitter 142 character limit
+```
+The plot shows that the sampling procedure has removed some noise from the data. Interestingly, we see how twitter texts are tightly constrained to its 142 character limit; news texts have a wider spread, but also seems mostly constrained to certain lengths (which would be expected, given the nature of news items); and blog texts have a wider spread.
+
+My next step is to combine the texts into a single dataset. Then, using the `sent_detect()` function from the `qdap` library to split each line into individual sentences. This produced a dataset with ```length(s.combined)``` lines.
+
+```{r Creating -grams,cache=TRUE, echo=FALSE}
+# combine sample texts and break into sentences (one sentence per line) 
+s.combined <- c(s.blogs,s.news,s.twitter)
+s.combined <- sent_detect(s.combined)
+
+
+```
+The line length distribution of the combined texts is plotted as below. 
+
+```{r Plot of Sentence lengths,echo=FALSE}
+nchar.scombined <- nchar(s.combined)
+plot.new()
+d.nchar.scombined <- density(nchar.scombined)
+
+plot(d.nchar.scombined,xlab="Number of Characters",ylab="Density",main="Distribution of Number of Characters per Sentence")
+
+summary(nchar(s.combined))
+```
+
+```{r Combined Samples Summary,echo=FALSE} 
+summaryTable3 <- data.frame(
+  "Source"=c("Combined"),
+  "Number of lines"=length(s.combined),
+  "Average length"=mean(nchar(s.combined)),
+  "Min length"=min(nchar(s.combined)),
+  "Max length"=max(nchar(s.combined)),
+  "Variance" = var(nchar(s.combined)),
+  "Std. Dev." = sd(nchar(s.combined))
+  )
+
+knitr::kable(summaryTable3)
+```
+
+Creating the sentence splits have caused some fragments to appear in the dataset. I'm not sure what is the impact of this yet, but I will deal with them later.
+
+```{r Fragments}
+head(s.combined[which(nchar(s.combined)<10)],10)
+```
+
+
+```{r Stemming & TDM,cache=TRUE,echo=FALSE}
+# stemmed.corpus <- tm_map(combined.corpus,stemDocument)
+# stemmed.corpus <- tm_map(stemmed.corpus,stemCompletion,dictionary=combined.corpus)
+                         
+# create a term document matrix
+# corpus.tdm <- TermDocumentMatrix(stemmed.corpus,control=list(wordLengths=c(1,Inf)))
+```
+
+## Creating the Corpus & Tokenising
+
+Next, the data is converted into a corpus with the `tm` library and then tokenized using the `NGramTokenizer()` function in the `RWeka` library  to obtain frequency counts for unigrams, bigrams, and trigrams. 
+
+Some transformations are performed while creating the corpus, which significantly reduced the size of the original corpus from 799.5Mb to 16.6Mb. I will show the transformations, as written in the comments:
+
+```{r The Corpus Maker, eval=FALSE}
+make_corpus <- function(chrVector) {
+  # create corpus
+  corpus<- Corpus(VectorSource(chrVector))
+
+  # Convert to lowercase
+  corpus <- tm_map(corpus, content_transformer(tolower))
+  
+   # remove emails
+  removeEmails <- function(x) {gsub("\\S+@\\S+", "", x)}
+ corpus <- tm_map(corpus,removeEmails)
+
+ # remove URLS
+  removeUrls <- function(x) {gsub("http[[:alnum:]]*","",x)}
+ corpus <- tm_map(corpus,removeUrls)
+ 
+ # Remove Twitter hashtags
+ removeHashtags <- function(x) {gsub("#[[:alnum:]]*","",x)}
+ corpus <- tm_map(corpus,removeHashtags)
+
+  # remove Twitter handles (e.g. @username)
+  removeHandles <- function(x) {gsub("@[[:alnum:]]*","",x)}
+  corpus <- tm_map(corpus,removeHandles)
+ 
+  # remove twitter specific terms like RT (retweet) and PM (private message)
+  corpus <- tm_map(corpus, removeWords, c("rt","pm","p m"))
+
+  # remove punctuation, numbers, whitespace, numbers and bad words  
+  corpus <- tm_map(corpus, removePunctuation)
+  corpus <- tm_map(corpus, stripWhitespace)
+  corpus<- tm_map(corpus,removeNumbers)
+  corpus <- tm_map(corpus, removeWords, stopwords("en"))
+  
+  # remove bad words (wordlist obtained from http://www.bannedwordlist.com)
+   badwords <- read.csv('./swearWords.csv',stringsAsFactors = FALSE,header=FALSE)
+   
+   corpus <- tm_map(corpus, removeWords, badwords)
+   corpus<- tm_map(corpus, PlainTextDocument)
+   corpus
+}
+```
+
+Looking for ways to reduce the size of the corpus further, I would next want to use word stemming and also find out if I need to further remove the noise which I have detected above. I have been having a problem with the performance of my computer when performing the stemming procedure so I have skipped the step until I have solved the problem.
+
+Then I create tokenised the corpus into 3 sets of n-grams: unigrams, bigrams, and trigrams as summarised below:
+
+```{r Tokenizing, echo=FALSE}
+
+# make into a corpus and apply transformations
+combined.corpus <- make_corpus(s.combined)
+
+corpus.df <-data.frame(text=unlist(sapply(combined.corpus, `[`, "content")), stringsAsFactors=F)
+unigrams <- NGramTokenizer(corpus.df, Weka_control(min = 1, max = 1))
+unigrams <- process_grams(unigrams)
+
+bigrams <- NGramTokenizer(corpus.df, Weka_control(min = 2, max = 2, delimiters = " \\r\\n\\t.,;:\"()?!"))
+bigrams <- process_grams(bigrams)
+
+trigrams <- NGramTokenizer(corpus.df, Weka_control(min = 3, max = 3, delimiters = " \\r\\n\\t.,;:\"()?!"))
+trigrams <- process_grams(trigrams)
+
+summaryTable4 <- data.frame(
+  "Grams"=c("Unigrams","Bigrams","Trigrams"),
+  "Example"=c(paste(unigrams$grams[23]),paste(bigrams$grams[23]),paste(trigrams$grams[23])),
+  "Count"=c(length(unigrams$grams),length(bigrams$grams),length(trigrams$grams))
+)
+summaryTable4
+```
+
+The n-grams are sorted by frequency (numbers of times they appear in the texts), and the coverage is calculated. We can see from the following plots what the coverage looks like:
+
+```{r Coverage plots - Unigram, echo=FALSE} 
+plot(unigrams$cumpct,ylab="Coverage (%)",xlab="Term Count",main="Coverage for 1-gram Terms")
+abline(h=50)
+abline(h=80)
+abline(h=90)
+
+grams <- unigrams
+```
+The number of unigrams to achieve 50% coverage is ```r length(grams[which(grams$cumpct<=50),c("grams")])```; 
+80%: ```r length(grams[which(grams$cumpct<=80),c("grams")])```; and 90%: 
+```r length(grams[which(grams$cumpct<=90),c("grams")])```.
+
+If only ```r  length(unigrams[which(unigrams$cumpct<=90),c("grams")]) ``` unigrams is needed to cover 90% of the effective vocabulary, then it would seem that by removing very low frequency words I will be able to achieve a smaller dataset (```r paste(length(unigrams[which(unigrams$cumpct<=90),c("grams")])/length(unigrams$grams) * 100,"%")```) to base the prediction algorithm on. 
+
+It's also interesting to look at what are the most frequently used bigrams and trigrams:
+```{r bigrams and trigrams, cache=TRUE}
+head(bigrams)
+head(trigrams)
+```
+
+It seems that there are single letter words and acronyms which shouldn't be part of the corpus, and I would need to remove such terms in the next steps.
+
+## Conclusions & Next Steps
+
+From my current understanding, my plan for the remaining time for this project is to:
+
+- Remove noise such as single letter words, acronyms, non-English terms (e.g. chinese characters). 
+- Perhaps I will exclude terms which are shorter than a certain number of characters to ensure that I will have proper words; also, this may be better since I think prediction should help reduce time to type for longer, rare or frequently misspelled words and not short ones.
+- Use stemming and stem completion to reduce the number of terms in the corpus. Stemming will allow a root word to be predicted in place of its variants
+- Create the prediction algorithm --  I have yet to study how to do this. As I understand it, I can apply clustering to find word associations and predict relevant words by searching within clusters
+- Increase the sample size and optimize the final corpus to achieve appropriate coverage and improve prediction accuracy
+- Then create the final application in Shiny
+
+I have had a number of challenges to reach this far into this project. The learning curve is steep and I have had little time to work on this project, not least because I have been travelling the past week for the holiday season and been off the grid. Personal challenges aside, the technical challenge of the project is considerable, especially managing the processing time and memory usage, but with further study once I'm back I think is surmountable.
+
+Thank you.
+
+## Links
+1. The source code for this report can be found here: https://github.com/zaros/coursera-capstone
+2. The list of bad words was obtained from: http://www.bannedwordlist.com
+
+
